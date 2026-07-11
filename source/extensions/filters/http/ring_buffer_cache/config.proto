@@ -1,0 +1,8 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.http.ring_buffer_cache;
+
+message RingBufferCacheConfig {
+	// buffer size ( >= 1 )
+	uint32 ring_buffer_size = 1;
+}
