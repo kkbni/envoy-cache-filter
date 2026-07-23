@@ -31,6 +31,7 @@ envoy_cc_extension(
         "//source/extensions/filters/http/common:pass_through_filter_lib",
         "//envoy/http:filter_interface",
         "//envoy/http:header_map_interface",
+        "//source/common/http:header_map_lib",
         "@abseil-cpp//absl/container:flat_hash_map",
     ],
 )
