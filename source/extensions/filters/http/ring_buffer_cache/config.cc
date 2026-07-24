@@ -10,22 +10,13 @@ namespace RingBufferCache {
 absl::StatusOr<Http::FilterFactoryCb> RingBufferCacheConfigFactory::createFilterFactoryFromProto(
     const Protobuf::Message& proto_config,
     const std::string&,
-    Server::Configuration::FactoryContext& context) {
+    Server::Configuration::FactoryContext& /* context */) {
 
   // downcast the generic proto message to the specific configuration
   const auto& config_pb = dynamic_cast<const envoy::extensions::filters::http::ring_buffer_cache::RingBufferCacheConfig&>(proto_config);
   uint32_t size = config_pb.ring_buffer_size();
 
-  // allocate a thread-local storage slot
-  ThreadLocal::SlotPtr tls_slot = context.serverFactoryContext().threadLocal().allocateSlot();
-
-  tls_slot->set(
-    [size](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr {
-      return std::make_shared<ThreadLocalCache>(size);
-    }
-  );
-
-  auto config = std::make_shared<FilterConfig>(std::move(tls_slot));
+  auto config = std::make_shared<FilterConfig>(size);
 
   Http::FilterFactoryCb cb = [config](Http::FilterChainFactoryCallbacks& callbacks) -> void {
     callbacks.addStreamFilter(std::make_shared<RingBufferCacheFilter>(config));

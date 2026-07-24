@@ -1,86 +1,92 @@
 #include "source/extensions/filters/http/ring_buffer_cache/ring_buffer_cache.h"
-#include "source/common/http/header_map_impl.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
 namespace RingBufferCache {
 
-void ThreadLocalCache::insert(const std::string& key, Http::ResponseHeaderMapPtr&& headers, const std::string& body) {
-  auto it = cache_.find(key);
-  if( it != cache_.end() ) {
-    cache_[key] = {std::move(headers), body};
-    return;
+Http::FilterHeadersStatus RingBufferCacheFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool) 
+{
+  std::string key = std::string(headers.getPathValue());
+
+  bool is_leader;
+  entry_ = config_->cache_manager.getOrCreate(key, is_leader);
+
+  if( is_leader ) {
+    is_leader_ = true;
+    return Http::FilterHeadersStatus::Continue;
   }
 
-  // remove the oldest if buffer capacity is reached
-  if( cache_.size() >= max_size_ && !order_.empty() ) {
-    std::string oldest_key = order_.front();
-    order_.pop_front();
-    cache_.erase(oldest_key);
-  }
-  cache_[key] = {std::move(headers), body};
-  order_.push_back(key);
-}
-
-const CachedResponse* ThreadLocalCache::get(const std::string& key) const {
-  auto it = cache_.find(key);
-  if( it != cache_.end() ) {
-    return &it->second;
-  }
-  return nullptr;
-}
-
-Http::FilterHeadersStatus RingBufferCacheFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool) {
-  const std::string host = std::string(headers.getHostValue());
-  const std::string path = std::string(headers.getPathValue());
-  cache_key_ = absl::StrCat(host, path);
-
-  auto& cache = config_->tlsSlot().getTyped<ThreadLocalCache>();
-  const CachedResponse* cached = cache.get(cache_key_);
-
-  if( cached != nullptr ) {
-    ENVOY_LOG(debug, "Ring Buffer Cache Hit for key: {}", cache_key_);
-
-    // lambda to carry over cached response headers
-    auto modify_headers = [cached](Http::ResponseHeaderMap& response_headers) {
-      cached->headers->iterate(
-        [&response_headers](const Http::HeaderEntry& header) -> Http::HeaderMap::Iterate {
-          if( header.key().getStringView()[0] != ':' ) {
-            response_headers.addCopy(Http::LowerCaseString(header.key().getStringView()), header.value().getStringView());
-          }
-          return Http::HeaderMap::Iterate::Continue;
-        }
-      );
-    };
-
-    decoder_callbacks_->sendLocalReply(Http::Code::OK, cached->body, modify_headers, absl::nullopt, "ring_buffer_cache_hit");
+  // is follower
+  absl::MutexLock lock( &entry_->mutex );
+  if( entry_->state == CacheEntry::State::Ready ) 
+  { // ready - serve
+    decoder_callbacks_->encodeHeaders(Http::createHeaderMap<Http::ResponseHeaderMapImpl>(*entry_->headers), false, "ring_buffer_cache_hit");
+    decoder_callbacks_->encodeData(entry_->body, true);
     return Http::FilterHeadersStatus::StopIteration;
   }
-
-  ENVOY_LOG(debug, "Ring Buffer Cache Miss for key: {}", cache_key_);
-  is_cache_miss_ = true;
-  return Http::FilterHeadersStatus::Continue;
+  // else: downloading - wait for data from the leader
+  entry_->followers.push_back({
+    &decoder_callbacks_->dispatcher(),
+    is_active_,
+    decoder_callbacks_
+  });
+  return Http::FilterHeadersStatus::StopIteration;
 }
 
-Http::FilterHeadersStatus RingBufferCacheFilter::encodeHeaders(Http::ResponseHeaderMap& headers, bool end_stream) {
-  if( is_cache_miss_ && headers.getStatusValue() == "200" ) {
-    response_headers_ = Http::createHeaderMap<Http::ResponseHeaderMapImpl>(headers);
-    if( end_stream ) {
-      auto& cache = config_->tlsSlot().getTyped<ThreadLocalCache>();
-      cache.insert(cache_key_, std::move(response_headers_), "");
-    }
+Http::FilterHeadersStatus RingBufferCacheFilter::encodeHeaders(Http::ResponseHeaderMap& headers, bool end_stream) 
+{
+  if( !is_leader_ ) {
+    return Http::FilterHeadersStatus::Continue;
+  }
+  // is leader
+  absl::MutexLock lock( &entry_->mutex );
+  entry_->headers = Http::createHeaderMap<Http::ResponseHeaderMapImpl>(headers);
+
+  // broadcast headers to all followers
+  for( auto& follower : entry_->followers ) {
+    auto headers_copy = Http::createHeaderMap<Http::ResponseHeaderMapImpl>(headers);
+    std::shared_ptr<bool> active = follower.is_active;
+    Http::StreamDecoderFilterCallbacks* cb = follower.callbacks;
+
+    follower.dispatcher->post( [active, cb, h = std::move(headers_copy), end_stream]() mutable {
+      if( *active ) { cb->encodeHeaders(std::move(h), end_stream, "ring_buffer_cache_hit"); }
+    });
   }
   return Http::FilterHeadersStatus::Continue;
 }
 
-Http::FilterDataStatus RingBufferCacheFilter::encodeData(Buffer::Instance& data, bool end_stream) {
-  if( is_cache_miss_ && response_headers_ != nullptr ) {
-    response_body_.append(data.toString());
-    if( end_stream ) {
-      auto& cache = config_->tlsSlot().getTyped<ThreadLocalCache>();
-      cache.insert(cache_key_, std::move(response_headers_), response_body_);
+Http::FilterDataStatus RingBufferCacheFilter::encodeData(Buffer::Instance& data, bool end_stream) 
+{
+  if( !is_leader_ ) {
+    return Http::FilterDataStatus::Continue;
+  }
+
+  // is leader
+  absl::MutexLock lock( &entry_->mutex );
+  for( const Buffer::RawSlice& slice : data.getRawSlices() ) {
+    entry_->body.add(slice.mem_, slice.len_);
+  }
+
+  if( end_stream ) {
+    entry_->state = CacheEntry::State::Ready;
+  }
+
+  // stream chunk of data to all followers
+  for( auto& follower : entry_->followers ) {
+    auto data_copy = std::make_shared<Buffer::OwnedImpl>();
+    for( const Buffer::RawSlice& slice : data.getRawSlices() ) {
+      data_copy->add(slice.mem_, slice.len_);
     }
+
+    std::shared_ptr<bool> active = follower.is_active;
+    Http::StreamDecoderFilterCallbacks* cb = follower.callbacks;
+
+    follower.dispatcher->post([active, cb, data_copy, end_stream]() {
+      if( *active ) {
+        cb->encodeData(*data_copy, end_stream);
+      }
+    });
   }
   return Http::FilterDataStatus::Continue;
 }
