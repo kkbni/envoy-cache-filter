@@ -5,10 +5,9 @@ namespace Extensions {
 namespace HttpFilters {
 namespace RingBufferCache {
 
-Http::FilterHeadersStatus RingBufferCacheFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool) 
+Http::FilterHeadersStatus RingBufferCacheFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool)
 {
   std::string key = std::string(headers.getPathValue());
-
   bool is_leader;
   entry_ = config_->cache_manager.getOrCreate(key, is_leader);
 
@@ -16,16 +15,34 @@ Http::FilterHeadersStatus RingBufferCacheFilter::decodeHeaders(Http::RequestHead
     is_leader_ = true;
     return Http::FilterHeadersStatus::Continue;
   }
-
   // is follower
   absl::MutexLock lock( &entry_->mutex );
-  if( entry_->state == CacheEntry::State::Ready ) 
-  { // ready - serve
+  if( entry_->state == CacheEntry::State::Ready )
+  { // downloaded - serve
     decoder_callbacks_->encodeHeaders(Http::createHeaderMap<Http::ResponseHeaderMapImpl>(*entry_->headers), false, "ring_buffer_cache_hit");
-    decoder_callbacks_->encodeData(entry_->body, true);
+
+    Buffer::OwnedImpl body_copy;
+    for( const Buffer::RawSlice& slice : entry_->body.getRawSlices() ) {
+      body_copy.add(slice.mem_, slice.len_);
+    }
+    decoder_callbacks_->encodeData(body_copy, true);
+
     return Http::FilterHeadersStatus::StopIteration;
   }
-  // else: downloading - wait for data from the leader
+  // mid stream
+  // if the leader got the headers - send to followers
+  if( entry_->headers != nullptr ) {
+    decoder_callbacks_->encodeHeaders(Http::createHeaderMap<Http::ResponseHeaderMapImpl>(*entry_->headers), false, "ring_buffer_cache_hit");
+  }
+  // if the leader got data - send to followers
+  if( entry_->body.length() > 0 ) {
+    Buffer::OwnedImpl body_copy;
+    for( const Buffer::RawSlice& slice : entry_->body.getRawSlices() ) {
+      body_copy.add(slice.mem_, slice.len_);
+    }
+    decoder_callbacks_->encodeData(body_copy, false /* leader isn't done */);
+  }
+
   entry_->followers.push_back({
     &decoder_callbacks_->dispatcher(),
     is_active_,
