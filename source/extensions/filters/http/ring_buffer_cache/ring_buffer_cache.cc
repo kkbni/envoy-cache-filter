@@ -7,7 +7,7 @@ namespace RingBufferCache {
 
 Http::FilterHeadersStatus RingBufferCacheFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool)
 {
-  std::string key = std::string(headers.getPathValue());
+  std::string key = std::string(headers.getHostValue()) + "|" + std::string(headers.getPathValue());
   bool is_leader;
   entry_ = config_->cache_manager.getOrCreate(key, is_leader);
 
@@ -22,9 +22,7 @@ Http::FilterHeadersStatus RingBufferCacheFilter::decodeHeaders(Http::RequestHead
     decoder_callbacks_->encodeHeaders(Http::createHeaderMap<Http::ResponseHeaderMapImpl>(*entry_->headers), false, "ring_buffer_cache_hit");
 
     Buffer::OwnedImpl body_copy;
-    for( const Buffer::RawSlice& slice : entry_->body.getRawSlices() ) {
-      body_copy.add(slice.mem_, slice.len_);
-    }
+    body_copy.add(entry_->ring_buffer.storage().data(), entry_->ring_buffer.totalWritten());
     decoder_callbacks_->encodeData(body_copy, true);
 
     return Http::FilterHeadersStatus::StopIteration;
@@ -35,11 +33,9 @@ Http::FilterHeadersStatus RingBufferCacheFilter::decodeHeaders(Http::RequestHead
     decoder_callbacks_->encodeHeaders(Http::createHeaderMap<Http::ResponseHeaderMapImpl>(*entry_->headers), false, "ring_buffer_cache_hit");
   }
   // if the leader got data - send to followers
-  if( entry_->body.length() > 0 ) {
+  if( entry_->ring_buffer.totalWritten() > 0 ) {
     Buffer::OwnedImpl body_copy;
-    for( const Buffer::RawSlice& slice : entry_->body.getRawSlices() ) {
-      body_copy.add(slice.mem_, slice.len_);
-    }
+    body_copy.add(entry_->ring_buffer.storage().data(), entry_->ring_buffer.totalWritten());
     decoder_callbacks_->encodeData(body_copy, false /* leader isn't done */);
   }
 
@@ -51,7 +47,7 @@ Http::FilterHeadersStatus RingBufferCacheFilter::decodeHeaders(Http::RequestHead
   return Http::FilterHeadersStatus::StopIteration;
 }
 
-Http::FilterHeadersStatus RingBufferCacheFilter::encodeHeaders(Http::ResponseHeaderMap& headers, bool end_stream) 
+Http::FilterHeadersStatus RingBufferCacheFilter::encodeHeaders(Http::ResponseHeaderMap& headers, bool end_stream)
 {
   if( !is_leader_ ) {
     return Http::FilterHeadersStatus::Continue;
@@ -73,7 +69,7 @@ Http::FilterHeadersStatus RingBufferCacheFilter::encodeHeaders(Http::ResponseHea
   return Http::FilterHeadersStatus::Continue;
 }
 
-Http::FilterDataStatus RingBufferCacheFilter::encodeData(Buffer::Instance& data, bool end_stream) 
+Http::FilterDataStatus RingBufferCacheFilter::encodeData(Buffer::Instance& data, bool end_stream)
 {
   if( !is_leader_ ) {
     return Http::FilterDataStatus::Continue;
@@ -82,11 +78,14 @@ Http::FilterDataStatus RingBufferCacheFilter::encodeData(Buffer::Instance& data,
   // is leader
   absl::MutexLock lock( &entry_->mutex );
   for( const Buffer::RawSlice& slice : data.getRawSlices() ) {
-    entry_->body.add(slice.mem_, slice.len_);
+    entry_->ring_buffer.write(static_cast<const char*>(slice.mem_), slice.len_);
   }
 
   if( end_stream ) {
-    entry_->state = CacheEntry::State::Ready;
+    // only mark Ready if fits in the buffer
+    if( !entry_->ring_buffer.overflowed() ) {
+      entry_->state = CacheEntry::State::Ready;
+    }
   }
 
   // stream chunk of data to all followers

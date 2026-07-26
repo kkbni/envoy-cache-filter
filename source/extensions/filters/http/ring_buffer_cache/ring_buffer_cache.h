@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <algorithm>
 
 #include "envoy/http/filter.h"
 #include "envoy/event/dispatcher.h"
@@ -17,14 +18,50 @@ namespace Extensions {
 namespace HttpFilters {
 namespace RingBufferCache {
 
+class RingBuffer {
+public:
+  explicit RingBuffer(size_t capacity) : capacity_(capacity), storage_(capacity) {}
+
+  void write(const char* data, size_t len)
+  {
+    total_written_ += len;
+    size_t remaining = len;
+    size_t offset = 0;
+
+    while( remaining > 0 )
+    {
+      size_t space_at_end = capacity_ - write_pos_;
+      size_t chunk = std::min(remaining, space_at_end);
+
+      // memcpy for better performance
+      std::memcpy(storage_.data() + write_pos_, data + offset, chunk);
+
+      write_pos_ = (write_pos_ + chunk) % capacity_;
+      remaining -= chunk;
+      offset += chunk;
+    }
+  }
+  bool overflowed() const { return total_written_ > capacity_; }
+  const std::vector<char>& storage() const { return storage_; }
+  size_t totalWritten() const { return total_written_; }
+
+private:
+  size_t capacity_;
+  std::vector<char> storage_;
+  size_t write_pos_ = 0;
+  size_t total_written_ = 0;
+};
+
 struct CacheEntry
 {
+  explicit CacheEntry(uint32_t max_size) : ring_buffer(max_size) {}
+
   enum class State { Fetching, Ready };
   State state { State::Fetching };
   absl::Mutex mutex;
 
   Http::ResponseHeaderMapPtr headers;
-  Buffer::OwnedImpl body;
+  RingBuffer ring_buffer;
 
   // follower - request waiting for data
   struct Follower {
@@ -38,14 +75,28 @@ struct CacheEntry
 // thread shared cache map
 class SharedCacheManager {
 public:
+  explicit SharedCacheManager(uint32_t max_size) : max_size_(max_size) {}
+
   std::shared_ptr<CacheEntry> getOrCreate(const std::string& key, bool& is_leader) {
     absl::MutexLock lock( &mutex_ );
     auto it = map_.find(key);
     if( it != map_.end() ) {
-      is_leader = false;
-      return it->second;
+      bool overflowed = false;
+
+      // check if the active fetch has crashed the memory limit
+      absl::MutexLock entry_lock( &it->second->mutex );
+      overflowed = it->second->ring_buffer.overflowed();
+
+      if( overflowed ) {
+        // if overflowed - don't let new followers join a corrupted buffer
+        // erase it - new request acts as a cache miss and fetches its own copy
+        map_.erase(it);
+      } else {
+        is_leader = false;
+        return it->second;
+      }
     }
-    auto entry = std::make_shared<CacheEntry>();
+    auto entry = std::make_shared<CacheEntry>(max_size_);
     map_[key] = entry;
     is_leader = true;
     return entry;
@@ -53,15 +104,16 @@ public:
 
 private:
   absl::Mutex mutex_;
+  uint32_t max_size_;
   absl::flat_hash_map<std::string, std::shared_ptr<CacheEntry>> map_;
 };
 
 class FilterConfig {
 public:
-  explicit FilterConfig(uint32_t size) : max_size(size) {}
+  explicit FilterConfig(uint32_t size) : max_size(size), cache_manager(size) {}
 
-  SharedCacheManager cache_manager;
   uint32_t max_size;
+  SharedCacheManager cache_manager;
 };
 
 class RingBufferCacheFilter : public Http::PassThroughFilter {
