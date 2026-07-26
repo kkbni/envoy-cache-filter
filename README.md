@@ -31,7 +31,7 @@ Watermark buffers (Envoy's backpressure mechanism) aren't respected for coalesce
 
 The cache lives in an HTTP filter, `source/extensions/filters/http/ring_buffer_cache`, that sits in Envoy's filter chain and looks at both the request (to compute the cache key) and the response (to populate the cache). It's registered like any other extension, included into `source/extensions/extensions_build_config.bzl` so it gets compiled into `envoy-static`.
 
-- **Cache key:** the request's `Host` header plus its path. The assignment allows a configurable key instead; I kept it fixed for this version. Making the set of headers folded into the key configurable (closer to how `Vary` works) would be a small addition on top of the same config, and is the first place I'd look if this needed to grow.
+- **Cache key:** the request's `Host` header plus its path. The assignment allows a configurable key instead, but I kept it fixed for this version. Making the set of headers folded into the key configurable (closer to how `Vary` works) would be a small addition on top of the same config, and is the first place I'd look if this needed to grow.
 - **Storage:** every key gets its own fixed-size ring buffer. The size is a field in the filter's `config.proto`, set once in `envoy.yaml`. This bounds the memory used per cached object regardless of how large the real response is.
 - **Number of keys:** unbounded - the cache can grow to hold as many distinct URLs as show up; only the size of each individual entry is capped. I come back to why that's a real limitation outside of a take-home in the trade-offs section below.
 - **Storage medium:** RAM only. Nothing is written to disk, and the cache doesn't survive a restart.
@@ -66,9 +66,11 @@ As the Leader receives the response from the origin, it doesn't wait for the who
 
 Once the Leader finishes and the entry moves to `READY`, any new request for that key is served straight out of the ring buffer - no Leader/Follower involved at all at that point.
 
+- **Handling Client Disconnects:** If a Follower's client drops the connection mid-wait, we need to ensure the Leader doesn't try to post data to a destroyed stream. Each Follower captures a `std::shared_ptr<bool> is_active` into its posted callback, which is set to `false` in the filter's destructor. Because a connection's callbacks run on that specific connection's worker thread, this safely prevents use-after-free errors without requiring a lock.
+
 ## Bugs I Hit Along the Way
 
-These are the two bugs I spent the most time on, and honestly the most interesting part of the assignment. Both only showed up once I started testing with real concurrent load instead of one request at a time.
+These are the bugs I spent the most time on, and honestly the most interesting part of the assignment. Most of them only showed up once I started testing with real concurrent load instead of one request at a time.
 
 ### The Mid-Stream Race Condition
 
@@ -91,6 +93,11 @@ The fix: when a Follower registers, it immediately checks what the Leader has al
 ### The Buffer-Consumption Bug
 
 While fixing the race condition I found a second, unrelated bug: I was passing the cached buffer straight into `encodeData()`. Envoy's buffers are designed to be drained by that call, so the first reader of a cached entry would empty it out corrupting the cache for the next request that tried to read it. The fix was to copy the buffer's contents before handing them to `encodeData()`, so reading a cache entry never changes it.
+
+### The Unbounded Cache Oversight
+My initial implementation successfully read the `ring_buffer_size` from the Envoy config, but I mistakenly backed the storage with a standard Envoy `Buffer::OwnedImpl` that just grew infinitely. It was an unbounded cache, meaning a request for a massive file would eventually exhaust the proxy's memory.
+
+The fix was to replace the Envoy buffer with a custom `RingBuffer` class using a fixed-capacity `std::vector<char>` and modulo arithmetic. If a response exceeds the configured capacity, the buffer wraps around and overwrites the oldest bytes. To prevent future clients from receiving a corrupted, partially overwritten file, the entry is flagged as `overflowed`. The active Followers still receive the live broadcast safely in memory, but the entry is never marked `READY`, ensuring subsequent requests fall back to the origin rather than reading broken data.
 
 ## Watermarks and Backpressure
 
