@@ -1,6 +1,7 @@
 # Envoy Ring-Buffer Cache with Request Coalescing
 
 *Design write-up - CDN77 take-home assignment*
+> **Note:** This project is based on the [Envoy Proxy](https://www.envoyproxy.io/) source code. The original upstream documentation can be found in [DOC_README.md](DOC_README.md).
 
 ## Table of Contents
 - [Summary](#summary)
