@@ -139,6 +139,7 @@ The fix was to replace the Envoy buffer with a custom `RingBuffer` class using a
 While preparing to talk through this project, I re-read my own filter more critically and found two things worth fixing. I'm calling them out explicitly rather than folding them in quietly, since being upfront about what a second pass caught seemed more useful than pretending the first version was already complete.
 
 - **`ring_buffer_size: 0` crashed the proxy.** `config.proto` documents the field as `>= 1`, but nothing enforced that. Proto3 leaves an unset `uint32` at `0`, and that value went straight into `RingBuffer`'s capacity with no check. Since `RingBuffer::write()` does `write_pos_ % capacity_`, a capacity of `0` is a division by zero on the very first byte written to the cache - a crash. Fixed by rejecting `ring_buffer_size == 0` in `createFilterFactoryFromProto`, so a bad config fails to load with an error instead of crashing a worker thread on the first real request.
+- **The demo `envoy.yaml` never actually tested a `Ready` state cache hit.** It shipped with `ring_buffer_size: 10` (10 bytes) against `/WORKSPACE`, which is 888 bytes. Every write overflowed the buffer immediately, so the entry never reached `Ready`. I bumped it to `65536` (64 KiB), comfortably larger than the demo target, so [How I Tested It](#how-i-tested-it) now actually exercises the `Ready` path.
 
 ## Building and Running
 

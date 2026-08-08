@@ -26,7 +26,7 @@ static_resources:
           - name: envoy.filters.http.ring_buffer_cache
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.ring_buffer_cache.RingBufferCacheConfig
-              ring_buffer_size: 10
+              ring_buffer_size: 65536 # 64 KiB
           # ------
           - name: envoy.filters.http.router
             typed_config:
