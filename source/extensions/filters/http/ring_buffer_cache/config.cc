@@ -16,6 +16,11 @@ absl::StatusOr<Http::FilterFactoryCb> RingBufferCacheConfigFactory::createFilter
   const auto& config_pb = dynamic_cast<const envoy::extensions::filters::http::ring_buffer_cache::RingBufferCacheConfig&>(proto_config);
   uint32_t size = config_pb.ring_buffer_size();
 
+  if( size == 0 ) {
+    return absl::InvalidArgumentError(
+        "envoy.filters.http.ring_buffer_cache: ring_buffer_size must be >= 1 (got 0)");
+  }
+
   auto config = std::make_shared<FilterConfig>(size);
 
   Http::FilterFactoryCb cb = [config](Http::FilterChainFactoryCallbacks& callbacks) -> void {

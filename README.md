@@ -12,6 +12,7 @@
 - [Watermarks and Backpressure](#watermarks-and-backpressure)
 - [Limitations and Trade-offs](#limitations-and-trade-offs)
 - [What I Would Do Differently in Production](#what-i-would-do-differently-in-production)
+- [Post-Submission Fixes](#post-submission-fixes)
 - [Building and Running](#building-and-running)
 - [How I Tested It](#how-i-tested-it)
 
@@ -108,7 +109,7 @@ The fix was to replace the Envoy buffer with a custom `RingBuffer` class using a
 
 **HTTP/1.1** maps one request to one TCP connection, and flow control only exists at the connection level - you can't pause data to one Follower without pausing the whole connection it's on. So every Follower's buffer occupancy needs to be tracked individually, using Envoy's watermark callbacks. When a specific Follower crosses its high watermark, it gets pulled out of the in-memory broadcast group. Instead of continuing to hold its data in RAM, it starts reading from a temporary file on disk that the Leader is also writing to in the background. Fast Followers keep reading straight from RAM, the slow one falls back to disk at its own pace, and the Leader's fetch from the origin is never paused.
 
-**HTTP/2 and HTTP/3** both multiplex many requests over a single connection and do flow control per-stream, so Envoy has fine-grained control complared to HTTP/1.1. You'd still track each Follower's buffer occupancy individually, but instead of the disk fallback, we could reset just that one stream once it crosses its high watermark - that Follower gets a 503 (Service Unavailable) and its buffer is freed immediately, while the Leader and every other Follower on the same multiplexed connection carry on.
+**HTTP/2 and HTTP/3** both multiplex many requests over a single connection and do flow control per-stream, so Envoy has fine-grained control compared to HTTP/1.1. You'd still track each Follower's buffer occupancy individually, but instead of the disk fallback, we could reset just that one stream once it crosses its high watermark - that Follower gets a 503 (Service Unavailable) and its buffer is freed immediately, while the Leader and every other Follower on the same multiplexed connection carry on.
 
 ## Limitations and Trade-offs
 
@@ -130,8 +131,14 @@ The fix was to replace the Envoy buffer with a custom `RingBuffer` class using a
 1. **Get rid of the single global mutex.** The simplest fix is lock striping: split the cache map into N partitions (e.g. by `hash(key) % N`), each with its own mutex, so that unrelated keys stop contending with each other. The more thorough fix (and the one that fits how Envoy is built) is to stop using a mutex at all: designate one thread as the only owner of the cache map, and have worker threads talk to it by posting messages (`dispatcher.post()`) instead of taking a lock. The owner thread processes lookups one at a time with no contention and posts results back to the worker that asked. Envoy's whole architecture is built around not blocking worker threads, so this is the more "native" direction - the mutex version is just much easier to get right first, which is why I started there.
 2. **Implement proper cache expiration and validation.** Right now anything under a given Host+Path is cached unconditionally and stays until overwritten. A production cache needs to respect origin instructions (like the `Vary` header), expire files based on TTL, and provide a way to manually clear out files.
 3. **Think about cross-node behavior.** A CDN edge is usually more than one Envoy instance. To cache effectively across a whole cluster, the nodes either need to talk to a separate, shared caching database (which adds a network delay), or the load balancer needs to be smart enough to always route requests for the same URL to the exact same server node. I haven't implemented either of these. It's the most obvious next problem once a single node works correctly.
-4. **Make the cache observable.** Right now the only way I confirmed this was working was watching `curl` output and the dummy origin's own request log. In production I'd expose hit/miss counters and current memory usage through Envoy's stats system (the same admin interface I used to check `http.ingress_http.downstream_rq_completed` while testing) so cache behavior is visible without a manual test every time.
+4. **Make the cache observable.** Right now the only way I confirmed this was working was watching `curl` output and the dummy origin's own request log. In production, I'd expose hit/miss counters and current memory usage through Envoy's stats system (the same admin interface I used to check `http.ingress_http.downstream_rq_completed` while testing) so cache behavior is visible without a manual test every time.
 5. **Handle watermarks properly**, with each protocol-specific approach [above](#watermarks-and-backpressure).
+
+## Post-Submission Fixes
+
+While preparing to talk through this project, I re-read my own filter more critically and found two things worth fixing. I'm calling them out explicitly rather than folding them in quietly, since being upfront about what a second pass caught seemed more useful than pretending the first version was already complete.
+
+- **`ring_buffer_size: 0` crashed the proxy.** `config.proto` documents the field as `>= 1`, but nothing enforced that. Proto3 leaves an unset `uint32` at `0`, and that value went straight into `RingBuffer`'s capacity with no check. Since `RingBuffer::write()` does `write_pos_ % capacity_`, a capacity of `0` is a division by zero on the very first byte written to the cache - a crash. Fixed by rejecting `ring_buffer_size == 0` in `createFilterFactoryFromProto`, so a bad config fails to load with an error instead of crashing a worker thread on the first real request.
 
 ## Building and Running
 
