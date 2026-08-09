@@ -33,7 +33,7 @@ Http::FilterHeadersStatus RingBufferCacheFilter::decodeHeaders(Http::RequestHead
     decoder_callbacks_->encodeHeaders(Http::createHeaderMap<Http::ResponseHeaderMapImpl>(*entry_->headers), false, "ring_buffer_cache_hit");
   }
   // if the leader got data - send to followers
-  if( entry_->ring_buffer.totalWritten() > 0 ) {
+  if( entry_->ring_buffer.totalWritten() > 0 && !entry_->ring_buffer.overflowed() ) {
     Buffer::OwnedImpl body_copy;
     body_copy.add(entry_->ring_buffer.storage().data(), entry_->ring_buffer.totalWritten());
     decoder_callbacks_->encodeData(body_copy, false /* leader isn't done */);

@@ -23,6 +23,7 @@ This repo adds a custom HTTP filter to Envoy (built from source at `v1.38.3`) th
 The cache key is the request's `Host` header plus its path. Each cache entry is backed by a fixed-size ring buffer, with the size configurable through the filter's config. I built this in two passes:
 
 1. A first version using Envoy's thread-local storage - the simplest thing that compiles, but it turns out not to actually solve the problem the assignment is about. Testing exposed this quickly, and the reason why is worth explaining.
+
 2. A second version using a single cache shared across worker threads, protected by a mutex, with a Leader/Follower model to do the actual coalescing.
 
 Along the way I hit two real concurrency bugs while load-testing with parallel requests. They ended up being the most useful part of the whole exercise, so they're written up in detail below.
@@ -34,8 +35,11 @@ Watermark buffers (Envoy's backpressure mechanism) aren't respected for coalesce
 The cache lives in an HTTP filter, `source/extensions/filters/http/ring_buffer_cache`, that sits in Envoy's filter chain and looks at both the request (to compute the cache key) and the response (to populate the cache). It's registered like any other extension, included into `source/extensions/extensions_build_config.bzl` so it gets compiled into `envoy-static`.
 
 - **Cache key:** the request's `Host` header plus its path. The assignment allows a configurable key instead, but I kept it fixed for this version. Making the set of headers folded into the key configurable (closer to how `Vary` works) would be a small addition on top of the same config, and is the first place I'd look if this needed to grow.
+
 - **Storage:** every key gets its own fixed-size ring buffer. The size is a field in the filter's `config.proto`, set once in `envoy.yaml`. This bounds the memory used per cached object regardless of how large the real response is.
+
 - **Number of keys:** unbounded - the cache can grow to hold as many distinct URLs as show up; only the size of each individual entry is capped. I come back to why that's a real limitation outside of a take-home in the trade-offs section below.
+
 - **Storage medium:** RAM only. Nothing is written to disk, and the cache doesn't survive a restart.
 
 **A note on file layout:** Envoy's built-in extensions usually keep their `.proto` config under `api/`, registered via an `extensions_metadata.yaml`, a `CODEOWNERS` entry, and a listing in `contrib_build_config.bzl`. I started down that path and backed out of it - that approach is meant for extensions going upstream into the real project, which this isn't. Everything for this filter (`config.proto`, `BUILD`, the `.h`/`.cc` files) is placed together under `source/extensions/filters/http/ring_buffer_cache`, which is simpler and doesn't pretend this is more than what it is.
@@ -120,26 +124,39 @@ The fix was to replace the Envoy buffer with a custom `RingBuffer` class using a
 
 **What it doesn't handle, and why that matters outside of a take-home:**
 - **One global mutex.** Every worker thread contends for the same lock to touch the cache map. Fine at low-to-moderate traffic. At real CDN request rates with many distinct keys, this lock is the first thing that would show up in a profile.
+
 - **Single-process cache.** This only coalesces requests landing on one Envoy process. A real deployment runs many Envoy instances - a miss on one node has no idea a neighboring node already fetched the same object a moment earlier.
+
 - **No cache expiration.** There are no time limits on cached items, and the filter doesn't read origin instructions like the `Vary` header. Once something is cached under a Host+Path key, it stays until it's overwritten in the ring buffer.
+
 - **No cap on the total number of keys.** The assignment explicitly allows this, but an unbounded number of ring buffers means unbounded total memory in a real deployment.
+
 - **Watermarks aren't respected for Followers**, as covered [above](#watermarks-and-backpressure).
+
 - **Only tested against a single trivial local origin.** No real load testing at concurrency levels anywhere close to what a CDN edge node would actually see.
 
 ## What I Would Do Differently in Production
 
 1. **Get rid of the single global mutex.** The simplest fix is lock striping: split the cache map into N partitions (e.g. by `hash(key) % N`), each with its own mutex, so that unrelated keys stop contending with each other. The more thorough fix (and the one that fits how Envoy is built) is to stop using a mutex at all: designate one thread as the only owner of the cache map, and have worker threads talk to it by posting messages (`dispatcher.post()`) instead of taking a lock. The owner thread processes lookups one at a time with no contention and posts results back to the worker that asked. Envoy's whole architecture is built around not blocking worker threads, so this is the more "native" direction - the mutex version is just much easier to get right first, which is why I started there.
+
 2. **Implement proper cache expiration and validation.** Right now anything under a given Host+Path is cached unconditionally and stays until overwritten. A production cache needs to respect origin instructions (like the `Vary` header), expire files based on TTL, and provide a way to manually clear out files.
+
 3. **Think about cross-node behavior.** A CDN edge is usually more than one Envoy instance. To cache effectively across a whole cluster, the nodes either need to talk to a separate, shared caching database (which adds a network delay), or the load balancer needs to be smart enough to always route requests for the same URL to the exact same server node. I haven't implemented either of these. It's the most obvious next problem once a single node works correctly.
+
 4. **Make the cache observable.** Right now the only way I confirmed this was working was watching `curl` output and the dummy origin's own request log. In production, I'd expose hit/miss counters and current memory usage through Envoy's stats system (the same admin interface I used to check `http.ingress_http.downstream_rq_completed` while testing) so cache behavior is visible without a manual test every time.
+
 5. **Handle watermarks properly**, with each protocol-specific approach [above](#watermarks-and-backpressure).
 
 ## Post-Submission Fixes
 
-While preparing to talk through this project, I re-read my own filter more critically and found two things worth fixing. I'm calling them out explicitly rather than folding them in quietly, since being upfront about what a second pass caught seemed more useful than pretending the first version was already complete.
+While preparing to talk through this project, I re-read my own filter more critically and found some things worth fixing. I'm calling them out explicitly rather than folding them in quietly, since being upfront about what another pass caught seemed more useful than pretending the first version was already complete.
 
 - **`ring_buffer_size: 0` crashed the proxy.** `config.proto` documents the field as `>= 1`, but nothing enforced that. Proto3 leaves an unset `uint32` at `0`, and that value went straight into `RingBuffer`'s capacity with no check. Since `RingBuffer::write()` does `write_pos_ % capacity_`, a capacity of `0` is a division by zero on the very first byte written to the cache - a crash. Fixed by rejecting `ring_buffer_size == 0` in `createFilterFactoryFromProto`, so a bad config fails to load with an error instead of crashing a worker thread on the first real request.
+
 - **The demo `envoy.yaml` never actually tested a `Ready` state cache hit.** It shipped with `ring_buffer_size: 10` (10 bytes) against `/WORKSPACE`, which is 888 bytes. Every write overflowed the buffer immediately, so the entry never reached `Ready`. I bumped it to `65536` (64 KiB), comfortably larger than the demo target, so [How I Tested It](#how-i-tested-it) now actually exercises the `Ready` path.
+
+- **The Out-of-Bounds read in Follower catch-up:** While looking over my concurrency model, I caught a race condition in the `decodeHeaders` catch-up block. When a Follower calls `getOrCreate()`, the entry might not be overflowed yet. However, if a context switch happens and the Leader receives a large enough chunk of data, the ring buffer can overflow (pushing `total_written_` past `capacity_`) before the Follower executes its catch-up read. Because the entry is still `FETCHING`, it isn't evicted. The Follower wakes up, sees `totalWritten() > 0`, and blindly copies `totalWritten()` bytes out of `storage().data()`. Because the underlying `std::vector` is strictly bounded to `capacity_`, this causes a raw heap over-read past the end of the allocation. Fixed by adding a strict `!entry_->ring_buffer.overflowed()` check directly to the catch-up condition. If the buffer has overflowed, the start of the response is gone, so the Follower safely skips the read.
+
 
 ## Building and Running
 
