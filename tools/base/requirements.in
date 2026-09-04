@@ -25,7 +25,7 @@ ply
 # `MessageFactory class is deprecated. Please use GetMessageClass() instead of MessageFactory.GetPrototype`
 protobuf<7.35.0
 pygithub
-pyopenssl>=24.2.1
+pyopenssl>=26.4.0
 pyreadline
 pyyaml
 setuptools
