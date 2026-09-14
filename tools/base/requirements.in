@@ -17,7 +17,7 @@ gitpython
 icalendar>=6.1.1
 jinja2
 
-multidict>=6.0.2
+multidict>=6.8.0
 orjson>=3.10.15
 pep8-naming
 ply
