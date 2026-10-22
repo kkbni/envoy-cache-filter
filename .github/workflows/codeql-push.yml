@@ -130,4 +130,4 @@ jobs:
 
     - name: Perform CodeQL Analysis
       # if: ${{ env.BUILD_TARGETS != '' }}
-      uses: github/codeql-action/analyze@95e58e9a2cdfd71adc6e0353d5c52f41a045d225  # codeql-bundle-v4.35.2
+      uses: github/codeql-action/analyze@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81  # codeql-bundle-v4.37.3
